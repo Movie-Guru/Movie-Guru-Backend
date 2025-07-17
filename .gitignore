@@ -1,0 +1,6 @@
+.env.development
+.env.production
+.venv/
+__pycache__/
+
+tempCodeRunnerFile.py
