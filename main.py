@@ -1,4 +1,11 @@
-def fahrenheit_to_celsius(f: float) -> float:
-    return 5 * (f - 32) / 9
+from fastapi import FastAPI
 
-print(fahrenheit_to_celsius(212))
+app = FastAPI()
+
+@app.get("/")
+async def root():
+    return {'message': 'API for Movie Guru Backend'}
+
+@app.get("/status")
+async def get_status():
+    return {"status": "ok"}
