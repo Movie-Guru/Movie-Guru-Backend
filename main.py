@@ -16,7 +16,7 @@ from typing import Any
 load_dotenv(dotenv_path=".env.development")
 app = FastAPI()
 
-NUM_MOVIES = 100
+NUM_MOVIES = 1200
 REDIS_TTL = 60 * 60 * 24 * 7 # one week
 S3_MOVIES_PATH_PREFIX = "movies/"
 
@@ -62,26 +62,7 @@ async def get_popular_movie_ids() -> list[int]:
             break
     return popular_movie_ids
 
-def get_bucket_delete_objects() -> list[dict[str, str]]:
-    """
-        Iterates through the set of objects in the bucket to extract a list
-        of dicts reprsenting the object keys
-        Used to format the delete request for the objects in the bucket 
-    """
-    paginator = s3_client.get_paginator("list_objects_v2") # type: ignore
-    page_iterator = paginator.paginate( # type: ignore
-        Bucket=os.getenv("S3_BUCKET_NAME"),
-        ExpectedBucketOwner=os.getenv("AWS_ACCOUNT_ID")
-    )
-
-    # The iterator uses lazy loading
-    return [
-        {"Key": obj["Key"]}
-        for page in page_iterator # type: ignore
-        for obj in page.get("Contents", []) # type: ignore
-    ]
-
-async def delete_bucket_objects() -> None:
+def delete_bucket_objects_sync() -> None:
     """
         Deletes all the objects in the S3 bucket used in this application
         Precondition: bucket must exist
@@ -90,24 +71,30 @@ async def delete_bucket_objects() -> None:
         print("Deleting objects in the S3 bucket...")
         start_time = time.time()
 
-        # Call a helper function to get a list of objects for deletion
-        objects = await asyncio.to_thread(get_bucket_delete_objects) # type: ignore
+        # Use a paginator to loop through the pages of objects in the bucket
+        paginator = s3_client.get_paginator("list_objects_v2") # type: ignore
+        page_iterator = paginator.paginate( # type: ignore
+            Bucket=os.getenv("S3_BUCKET_NAME"),
+            ExpectedBucketOwner=os.getenv("AWS_ACCOUNT_ID")
+        )
 
-        # Each "delete" API call can process at most MAX_KEYS keys
-        # This is a value set by AWS
-        MAX_KEYS = 1000
-        for i in range((len(objects) + MAX_KEYS - 1) // MAX_KEYS):
-            # Make API call to delete objects
-            await asyncio.to_thread(
-                s3_client.delete_objects, # type: ignore
+        num_objects = 0
+        for page in page_iterator: # type: ignore
+            # Generate a list of object dicts to use in the delete request
+            objects: list[dict[str, str]] = [{"Key": obj["Key"]} for obj in page["Contents"]] # type: ignore
+            num_objects += len(objects)
+
+            # Make a delete API request using this list of objects
+            s3_client.delete_objects( # type: ignore
                 Bucket=os.getenv("S3_BUCKET_NAME"),
                 Delete={
-                    "Objects": objects[MAX_KEYS * i: MAX_KEYS * (i + 1)]
+                    "Objects": objects
                 },
                 ExpectedBucketOwner=os.getenv("AWS_ACCOUNT_ID")
             )
+
         end_time = time.time()
-        print(f"Successfully deleted {len(objects)} objects in the S3 bucket.")
+        print(f"Successfully deleted {num_objects} objects in the S3 bucket.")
         print(f"Deletion of objects ran in {end_time - start_time} seconds")
     except Exception as e:
         print(e)
@@ -131,13 +118,13 @@ async def prepare_bucket() -> None:
             error_code: str = e.response["Error"]["Code"] # type: ignore
             if error_code == "BucketAlreadyOwnedByYou":
                 print("The S3 Bucket has been created previously.")
-                await delete_bucket_objects()
+                await asyncio.to_thread(delete_bucket_objects_sync)
             else:
                 traceback.print_exc()
         else:
             traceback.print_exc()
 
-def hydrate_and_store_movie_details(movie_id: int) -> None:
+def hydrate_and_store_movie_details_sync(movie_id: int) -> None:
     """
     Synchronous function that represents one logical unit of work (task)
     Hydrates movie details for the specified movie ID via TMDb API or Redis
@@ -192,7 +179,7 @@ async def perform_data_ingestion() -> None:
     start_time = time.time()
     movie_tasks: list[Awaitable[None]] = []
     for movie_id in popular_movie_ids:
-        movie_task: Awaitable[None] = asyncio.to_thread(hydrate_and_store_movie_details, movie_id)
+        movie_task: Awaitable[None] = asyncio.to_thread(hydrate_and_store_movie_details_sync, movie_id)
         movie_tasks.append(movie_task)
 
     # Gather the results of the hydration and storage tasks
