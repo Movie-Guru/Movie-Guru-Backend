@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 import json
 import os
+from pprint import pprint # type: ignore
 import redis
 from requests.exceptions import HTTPError
 import time
@@ -30,8 +31,7 @@ aws_session = boto3.session.Session(
     aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
     region_name=os.getenv("AWS_REGION")
 )
-s3 = aws_session.resource("s3") # type: ignore
-bucket = s3.Bucket(os.getenv("S3_BUCKET_NAME")) # type: ignore
+s3_client = aws_session.client("s3") # type: ignore
 
 async def get_popular_movie_ids() -> list[int]:
     """
@@ -62,6 +62,25 @@ async def get_popular_movie_ids() -> list[int]:
             break
     return popular_movie_ids
 
+def get_bucket_delete_objects() -> list[dict[str, str]]:
+    """
+        Iterates through the set of objects in the bucket to extract a list
+        of dicts reprsenting the object keys
+        Used to format the delete request for the objects in the bucket 
+    """
+    paginator = s3_client.get_paginator("list_objects_v2") # type: ignore
+    page_iterator = paginator.paginate( # type: ignore
+        Bucket=os.getenv("S3_BUCKET_NAME"),
+        ExpectedBucketOwner=os.getenv("AWS_ACCOUNT_ID")
+    )
+
+    # The iterator uses lazy loading
+    return [
+        {"Key": obj["Key"]}
+        for page in page_iterator # type: ignore
+        for obj in page.get("Contents", []) # type: ignore
+    ]
+
 async def delete_bucket_objects() -> None:
     """
         Deletes all the objects in the S3 bucket used in this application
@@ -70,12 +89,9 @@ async def delete_bucket_objects() -> None:
     try: 
         print("Deleting objects in the S3 bucket...")
         start_time = time.time()
-        # First get a list of existing object keys
-        object_summaries = await asyncio.to_thread(bucket.objects.all) # type: ignore
-        objects: list[dict[str, str]] = [
-            {"Key": object_summary.key} # type: ignore
-            for object_summary in object_summaries # type: ignore
-        ]
+
+        # Call a helper function to get a list of objects for deletion
+        objects = await asyncio.to_thread(get_bucket_delete_objects) # type: ignore
 
         # Each "delete" API call can process at most MAX_KEYS keys
         # This is a value set by AWS
@@ -83,7 +99,8 @@ async def delete_bucket_objects() -> None:
         for i in range((len(objects) + MAX_KEYS - 1) // MAX_KEYS):
             # Make API call to delete objects
             await asyncio.to_thread(
-                bucket.delete_objects, # type: ignore
+                s3_client.delete_objects, # type: ignore
+                Bucket=os.getenv("S3_BUCKET_NAME"),
                 Delete={
                     "Objects": objects[MAX_KEYS * i: MAX_KEYS * (i + 1)]
                 },
@@ -101,9 +118,13 @@ async def prepare_bucket() -> None:
     """
     print("Attempting to create S3 bucket...")
     try:
-        await asyncio.to_thread(bucket.create, CreateBucketConfiguration={ # type: ignore
-            "LocationConstraint": os.getenv("AWS_REGION")
-        })
+        await asyncio.to_thread(
+            s3_client.create_bucket, # type: ignore
+            Bucket=os.getenv("S3_BUCKET_NAME"),
+            CreateBucketConfiguration={
+                "LocationConstraint": os.getenv("AWS_REGION")
+            }
+        )
         print("Created a new S3 bucket.")
     except Exception as e:
         if hasattr(e, "response") and "Error" in e.response and "Code" in e.response["Error"]: # type: ignore
@@ -143,7 +164,11 @@ def hydrate_and_store_movie_details(movie_id: int) -> None:
 
     # Store the movie data in S3 bucket
     bucket_key = f"{S3_MOVIES_PATH_PREFIX}{movie_id}"
-    bucket.put_object(Key=bucket_key, Body=movie_data_bytes) # type: ignore
+    s3_client.put_object( # type: ignore
+        Bucket=os.getenv("S3_BUCKET_NAME"),
+        Key=bucket_key,
+        Body=movie_data_bytes
+    )
 
 
 async def perform_data_ingestion() -> None:
@@ -162,19 +187,6 @@ async def perform_data_ingestion() -> None:
     # Set up S3 bucket for data storage
     await prepare_bucket()
 
-    client = boto3.client('s3') # type: ignore
-    bucket_location: dict[str, Any] = await asyncio.to_thread(
-        client.get_bucket_location, # type: ignore
-        Bucket=os.getenv("S3_BUCKET_NAME"),
-        ExpectedBucketOwner=os.getenv("AWS_ACCOUNT_ID")
-    )
-    print(bucket_location)
-
-    await asyncio.to_thread(bucket.load) # type: ignore
-    print(bucket.bucket_arn) # type: ignore
-    print(bucket.bucket_region) # type: ignore
-    print(bucket.creation_date) # type: ignore
-    
     # For each movie id, fetch movie details and store data in the S3 bucket
     print("Fetching movie details and storing movie data in an S3 bucket...")
     start_time = time.time()
@@ -208,7 +220,7 @@ async def perform_data_ingestion() -> None:
     )
 
 @app.get("/admin/data_pipeline") # TODO change to POST, add verification
-async def execute_data_pipeline():
+async def execute_data_pipeline() -> dict[str, str]:
     print("Initiating data pipeline.")
     start_time = time.time()
     await perform_data_ingestion()
@@ -220,9 +232,9 @@ async def execute_data_pipeline():
     return {"status": "attempted"}
 
 @app.get("/")
-async def root():
+async def root() -> dict[str, str]:
     return {"message": "API for Movie Guru Backend"}
 
 @app.get("/status")
-async def get_status():
+async def get_status() -> dict[str, str]:
     return {"status": "ok"}
