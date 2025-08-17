@@ -2,10 +2,11 @@ import asyncio
 import boto3
 from collections.abc import Awaitable
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
 import json
 import os
 from pprint import pprint # type: ignore
+from pydantic import BaseModel
 import redis
 from requests.exceptions import HTTPError
 import time
@@ -16,7 +17,7 @@ from typing import Any
 load_dotenv(dotenv_path=".env.development")
 app = FastAPI()
 
-NUM_MOVIES = 1200
+NUM_MOVIES = 10000
 REDIS_TTL = 60 * 60 * 24 * 7 # one week
 S3_MOVIES_PATH_PREFIX = "movies/"
 
@@ -157,7 +158,6 @@ def hydrate_and_store_movie_details_sync(movie_id: int) -> None:
         Body=movie_data_bytes
     )
 
-
 async def perform_data_ingestion() -> None:
     """
         Fetches a list of movie id's, hydrates movie details via further TMDb 
@@ -206,17 +206,32 @@ async def perform_data_ingestion() -> None:
         f"{num_movies_processed} movies have been fetched and stored in S3."
     )
 
-@app.get("/admin/data_pipeline") # TODO change to POST, add verification
-async def execute_data_pipeline() -> dict[str, str]:
+class ExecuteDataPipelineRequest(BaseModel):
+    skip_data_ingestion: bool = False
+    password: str # Potential improvement: use auth headers
+
+
+@app.post("/admin/data_pipeline") # TODO add verification
+async def execute_data_pipeline(payload: ExecuteDataPipelineRequest) -> dict[str, str]:
+    if payload.password != os.getenv("ADMIN_API_KEY"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect password")
+    
     print("Initiating data pipeline.")
-    start_time = time.time()
-    await perform_data_ingestion()
-    end_time = time.time()
-    print(f"Full data ingestion pipeline ran in {end_time - start_time} seconds")
+
+    if payload.skip_data_ingestion:
+        print("You have requested to skip the data ingestion pipeline.")
+    else:        
+        print("Initiating data ingestion pipeline.")
+        start_time = time.time()
+        await perform_data_ingestion()
+        end_time = time.time()
+        print(f"Full data ingestion pipeline ran in {end_time - start_time} seconds")
 
     # TODO chunking and embedding into ChromaDB
+    
+    print("Data pipeline is complete.")
 
-    return {"status": "attempted"}
+    return {"status": "complete"}
 
 @app.get("/")
 async def root() -> dict[str, str]:
