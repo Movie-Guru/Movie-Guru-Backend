@@ -1,6 +1,7 @@
 import asyncio
 import boto3
 from collections.abc import Awaitable
+from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, status
 import json
@@ -74,10 +75,7 @@ def delete_bucket_objects_sync() -> None:
 
         # Use a paginator to loop through the pages of objects in the bucket
         paginator = s3_client.get_paginator("list_objects_v2") # type: ignore
-        page_iterator = paginator.paginate( # type: ignore
-            Bucket=os.getenv("S3_BUCKET_NAME"),
-            ExpectedBucketOwner=os.getenv("AWS_ACCOUNT_ID")
-        )
+        page_iterator = paginator.paginate(Bucket=os.getenv("S3_BUCKET_NAME")) # type: ignore
 
         num_objects = 0
         for page in page_iterator: # type: ignore
@@ -97,8 +95,8 @@ def delete_bucket_objects_sync() -> None:
         end_time = time.time()
         print(f"Successfully deleted {num_objects} objects in the S3 bucket.")
         print(f"Deletion of objects ran in {end_time - start_time} seconds")
-    except Exception as e:
-        print(e)
+    except Exception:
+        traceback.print_exc()
 
 async def prepare_bucket() -> None:
     """
@@ -158,7 +156,7 @@ def hydrate_and_store_movie_details_sync(movie_id: int) -> None:
         Body=movie_data_bytes
     )
 
-async def perform_data_ingestion() -> None:
+async def perform_data_acquisition() -> None:
     """
         Fetches a list of movie id's, hydrates movie details via further TMDb 
         API calls or Redis Caching, and uploads movie data to S3
@@ -179,11 +177,17 @@ async def perform_data_ingestion() -> None:
     start_time = time.time()
     movie_tasks: list[Awaitable[None]] = []
     for movie_id in popular_movie_ids:
-        movie_task: Awaitable[None] = asyncio.to_thread(hydrate_and_store_movie_details_sync, movie_id)
+        movie_task: Awaitable[None] = asyncio.to_thread(
+            hydrate_and_store_movie_details_sync,
+            movie_id
+        )
         movie_tasks.append(movie_task)
 
     # Gather the results of the hydration and storage tasks
-    movie_tasks_results: list[BaseException | None] = await asyncio.gather(*movie_tasks, return_exceptions=True)
+    movie_tasks_results: list[BaseException | None] = await asyncio.gather(
+        *movie_tasks,
+        return_exceptions=True
+    )
     end_time = time.time()
     print(f"Movie data hydration and storage ran in {end_time - start_time} seconds")
     
@@ -206,32 +210,117 @@ async def perform_data_ingestion() -> None:
         f"{num_movies_processed} movies have been fetched and stored in S3."
     )
 
+x: int = 0
+
+def index_single_movie_sync(object_key: str) -> None:
+    """
+        Takes in an object key for one of the movie objects in the S3 bucket
+        Uses the key to extract the corresponding movie data from the bucket
+        Performs chunking and generate embeddings for the movie
+        Stores embeddings in ChromaDB
+    """
+    global x
+    x += 1
+
+    obj_response: dict[str, Any] = s3_client.get_object( # type: ignore
+        Bucket=os.getenv("S3_BUCKET_NAME"),
+        Key=object_key
+    )
+    
+    movie = json.loads(obj_response["Body"].read().decode("utf-8")) # type: ignore
+    # pprint(movie)
+
+    # pprint(movie.keys())
+
+    try:
+        pprint(movie)
+        movie_id: int = movie["id"]
+        title: str = movie["title"]
+        release_year: int = datetime.fromisoformat(movie["release_date"]).year
+        genres: str = ", ".join([obj["name"] for obj in movie["genres"]])
+
+        print(movie_id)
+        print(title)
+        print(release_year)
+        print(genres)
+
+        print("CUTOFF")
+    except Exception:
+        traceback.print_exc()
+
+def get_indexing_tasks_sync() -> list[Awaitable[None]]:
+    """
+        Uses the S3 bucket to return a list of indexing tasks, one for each movie
+    """
+    paginator = s3_client.get_paginator("list_objects_v2") # type: ignore
+    page_iterator = paginator.paginate(Bucket=os.getenv("S3_BUCKET_NAME")) # type: ignore
+
+    indexing_tasks: list[Awaitable[None]] = []
+
+    for page in page_iterator: # type: ignore
+        for obj in page["Contents"]: # type: ignore
+            indexing_task: Awaitable[None] = asyncio.to_thread(
+                index_single_movie_sync,
+                obj["Key"] # type: ignore
+            )
+            indexing_tasks.append(indexing_task)
+    
+    return indexing_tasks
+
+async def perform_data_indexing() -> None:
+    """
+        Gets the movie data from the S3 bucket into the ChromaDB database
+    """
+    print("Running data indexing pipeline...")
+    start_time = time.time()
+
+    indexing_tasks = await asyncio.to_thread(get_indexing_tasks_sync)
+
+    indexing_tasks_results: list[BaseException | None] = await asyncio.gather(
+        indexing_tasks[0],
+        return_exceptions=True
+    )
+
+    print(f"There are {len(indexing_tasks_results)} task results.")
+
+    end_time = time.time()
+    print(f"Data indexing pipeline ran in {end_time - start_time} seconds")
+
 class ExecuteDataPipelineRequest(BaseModel):
-    skip_data_ingestion: bool = False
+    skip_data_acquisition: bool = False
     password: str # Potential improvement: use auth headers
 
-
-@app.post("/admin/data_pipeline") # TODO add verification
+@app.post("/admin/data_pipeline")
 async def execute_data_pipeline(payload: ExecuteDataPipelineRequest) -> dict[str, str]:
-    if payload.password != os.getenv("ADMIN_API_KEY"):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect password")
-    
-    print("Initiating data pipeline.")
+    try:
+        if payload.password != os.getenv("ADMIN_API_KEY"):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect password"
+            )
+        
+        print("Initiating data pipeline.")
 
-    if payload.skip_data_ingestion:
-        print("You have requested to skip the data ingestion pipeline.")
-    else:        
-        print("Initiating data ingestion pipeline.")
-        start_time = time.time()
-        await perform_data_ingestion()
-        end_time = time.time()
-        print(f"Full data ingestion pipeline ran in {end_time - start_time} seconds")
+        if payload.skip_data_acquisition:
+            print("You have requested to skip the data acquisition pipeline.")
+        else:        
+            print("Initiating data acquisition pipeline.")
+            start_time = time.time()
+            await perform_data_acquisition()
+            end_time = time.time()
+            print(f"Full data acquisition pipeline ran in {end_time - start_time} seconds")
 
-    # TODO chunking and embedding into ChromaDB
-    
-    print("Data pipeline is complete.")
-
-    return {"status": "complete"}
+        # Chunking and embedding into ChromaDB
+        await perform_data_indexing()
+        
+        print("Data pipeline is complete.")
+        return {"status": "complete"}
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error has occurred."
+        )
 
 @app.get("/")
 async def root() -> dict[str, str]:
