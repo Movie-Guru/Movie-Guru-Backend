@@ -5,6 +5,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, status
 import json
+from openai import OpenAI
 import os
 from pprint import pprint # type: ignore
 from pydantic import BaseModel
@@ -24,6 +25,7 @@ S3_MOVIES_PATH_PREFIX = "movies/"
 
 tmdb.API_KEY = os.getenv("TMDB_API_KEY")
 
+# Redis setup
 redis_client = redis.asyncio.from_url(os.getenv("REDIS_URL")) # type: ignore
 sync_redis_client = redis.from_url(os.getenv("REDIS_URL")) # type: ignore
 
@@ -34,6 +36,9 @@ aws_session = boto3.session.Session(
     region_name=os.getenv("AWS_REGION")
 )
 s3_client = aws_session.client("s3") # type: ignore
+
+# OpenAI setup
+openai_client = OpenAI()
 
 async def get_popular_movie_ids() -> list[int]:
     """
@@ -139,7 +144,7 @@ def hydrate_and_store_movie_details_sync(movie_id: int) -> None:
     else: # cache miss
         # This movie's details have not been fetched recently
         # Important movie metadata to fetch includes movie_id, title, release_year,
-        # genres, average_rating, popularity_score, cast, director
+        # genres, average_rating, popularity_score, cast, directors, revenue, runtime
         movie = tmdb.Movies(movie_id)
         # Populate attributes of the movie instance
         movie.info() # type: ignore
@@ -222,27 +227,58 @@ def index_single_movie_sync(object_key: str) -> None:
     global x
     x += 1
 
+    # Fetch the object from S3
     obj_response: dict[str, Any] = s3_client.get_object( # type: ignore
         Bucket=os.getenv("S3_BUCKET_NAME"),
         Key=object_key
     )
     
+    # Decode the S3 object response into a local dict
     movie = json.loads(obj_response["Body"].read().decode("utf-8")) # type: ignore
-    # pprint(movie)
-
-    # pprint(movie.keys())
 
     try:
-        pprint(movie)
+        # Parse important metadata from the movie dict
         movie_id: int = movie["id"]
         title: str = movie["title"]
         release_year: int = datetime.fromisoformat(movie["release_date"]).year
         genres: str = ", ".join([obj["name"] for obj in movie["genres"]])
+        average_rating: float = movie["vote_average"]
+        popularity_score: float = movie["popularity"]
+        cast: str = ", ".join([member["name"] for member in movie["cast"]])
+        directors: str = ", ".join(
+            [member["name"]
+            for member in movie["crew"]
+            if member["job"].lower() == "director"]
+        )
+        revenue: int = movie["revenue"]
+        runtime: int = movie["runtime"]
+        overview: str = movie["overview"]
 
         print(movie_id)
         print(title)
         print(release_year)
         print(genres)
+        print(average_rating)
+        print(popularity_score)
+        print(cast)
+        print(directors)
+        print(revenue)
+        print(runtime)
+        print(overview)
+
+        # Create embeddings for each of the text attributes
+        input = [
+            f"Cast: {cast}",
+            f"Director: {directors}",
+            f"Overview: {overview}"
+        ]
+
+        response = openai_client.embeddings.create(
+            model="text-embedding-3-small",
+            input=input
+        )
+        for embedding_obj in response.data:
+            print(len(embedding_obj.embedding))
 
         print("CUTOFF")
     except Exception:
