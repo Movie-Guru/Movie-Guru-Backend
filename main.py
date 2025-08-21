@@ -1,5 +1,8 @@
 import asyncio
 import boto3
+import chromadb
+from chromadb.errors import NotFoundError
+from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from collections.abc import Awaitable
 from datetime import datetime
 from dotenv import load_dotenv
@@ -22,6 +25,8 @@ app = FastAPI()
 NUM_MOVIES = 10000
 REDIS_TTL = 60 * 60 * 24 * 7 # one week
 S3_MOVIES_PATH_PREFIX = "movies/"
+EMBEDDING_MODEL_NAME="text-embedding-3-small"
+CHROMA_COLLECTION_NAME="movies"
 
 tmdb.API_KEY = os.getenv("TMDB_API_KEY")
 
@@ -39,6 +44,19 @@ s3_client = aws_session.client("s3") # type: ignore
 
 # OpenAI setup
 openai_client = OpenAI()
+openai_ef = OpenAIEmbeddingFunction(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    model_name=EMBEDDING_MODEL_NAME
+)
+
+# ChromaDB setup
+chroma_client = chromadb.PersistentClient()
+# TODO: Use HTTP client for prod
+# To make Chroma ready for serving API requests
+chroma_collection = chroma_client.get_or_create_collection(
+    name=CHROMA_COLLECTION_NAME,
+    embedding_function=openai_ef # type: ignore
+)
 
 async def get_popular_movie_ids() -> list[int]:
     """
@@ -224,9 +242,6 @@ def index_single_movie_sync(object_key: str) -> None:
         Performs chunking and generate embeddings for the movie
         Stores embeddings in ChromaDB
     """
-    global x
-    x += 1
-
     # Fetch the object from S3
     obj_response: dict[str, Any] = s3_client.get_object( # type: ignore
         Bucket=os.getenv("S3_BUCKET_NAME"),
@@ -236,51 +251,79 @@ def index_single_movie_sync(object_key: str) -> None:
     # Decode the S3 object response into a local dict
     movie = json.loads(obj_response["Body"].read().decode("utf-8")) # type: ignore
 
+    # Parse important metadata from the movie dict
+    movie_id: int = movie["id"]
+    title: str = movie["title"]
+    release_year: int | None
     try:
-        # Parse important metadata from the movie dict
-        movie_id: int = movie["id"]
-        title: str = movie["title"]
-        release_year: int = datetime.fromisoformat(movie["release_date"]).year
-        genres: str = ", ".join([obj["name"] for obj in movie["genres"]])
-        average_rating: float = movie["vote_average"]
-        popularity_score: float = movie["popularity"]
-        cast: str = ", ".join([member["name"] for member in movie["cast"]])
-        directors: str = ", ".join(
-            [member["name"]
-            for member in movie["crew"]
-            if member["job"].lower() == "director"]
-        )
-        revenue: int = movie["revenue"]
-        runtime: int = movie["runtime"]
-        overview: str = movie["overview"]
+        release_year = datetime.fromisoformat(movie["release_date"]).year
+    except ValueError:
+        release_year = None
+    genres: str | None = ", ".join([obj["name"] for obj in movie["genres"]]) or None
+    average_rating: float = movie["vote_average"]
+    popularity_score: float = movie["popularity"]
+    cast: str | None = ", ".join([member["name"] for member in movie["cast"]]) or None
+    director: str | None = ", ".join(
+        [member["name"]
+        for member in movie["crew"]
+        if member["job"].lower() == "director"]
+    ) or None
+    revenue: int = movie["revenue"]
+    runtime: int = movie["runtime"]
+    overview: str = movie["overview"]
 
-        print(movie_id)
-        print(title)
-        print(release_year)
-        print(genres)
-        print(average_rating)
-        print(popularity_score)
-        print(cast)
-        print(directors)
-        print(revenue)
-        print(runtime)
-        print(overview)
+    metadata: dict[str, str | int | float | None] = {
+        "movie_id": movie_id,
+        "title": title,
+        "release_year": release_year,
+        "genres": genres,
+        "average_rating": average_rating,
+        "popularity_score": popularity_score,
+        "cast": cast,
+        "director": director,
+        "revenue": revenue,
+        "runtime": runtime
+    }
 
-        # Create embeddings for each of the text attributes
-        input = [
+    # Create embeddings for each of the text attributes
+    # Add embeddings to Chroma collection
+    global chroma_collection
+    chroma_collection.add(
+        ids=[
+            f"{movie_id}-cast",
+            f"{movie_id}-director",
+            f"{movie_id}-overview"
+        ],
+        documents=[
             f"Cast: {cast}",
-            f"Director: {directors}",
+            f"Director: {director}",
             f"Overview: {overview}"
-        ]
+        ],
+        metadatas=[dict(metadata) for _ in range(3)]
+    )
 
-        response = openai_client.embeddings.create(
-            model="text-embedding-3-small",
-            input=input
+def prepare_chroma_collection_sync() -> None:
+    """
+        Deletes the existing Chroma collection if it exists
+        Creates a new empty Chroma collection
+    """
+    global chroma_collection
+
+    # Delete Chroma collection
+    try:
+        chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
+    except Exception as e:
+        if not isinstance(e, NotFoundError): 
+            traceback.print_exc()
+            return
+        
+    # Create new Chroma collection
+    try:
+        chroma_collection = chroma_client.create_collection(
+            name=CHROMA_COLLECTION_NAME,
+            embedding_function=openai_ef # type: ignore
         )
-        for embedding_obj in response.data:
-            print(len(embedding_obj.embedding))
-
-        print("CUTOFF")
+        print("New Chroma collection created.")
     except Exception:
         traceback.print_exc()
 
@@ -310,14 +353,22 @@ async def perform_data_indexing() -> None:
     print("Running data indexing pipeline...")
     start_time = time.time()
 
+    # Set up Chroma collection for storing embeddings
+    await asyncio.to_thread(prepare_chroma_collection_sync)
+    
+    print("Proceeding with data indexing pipeline...")
     indexing_tasks = await asyncio.to_thread(get_indexing_tasks_sync)
-
     indexing_tasks_results: list[BaseException | None] = await asyncio.gather(
-        indexing_tasks[0],
+        *indexing_tasks,
         return_exceptions=True
     )
 
     print(f"There are {len(indexing_tasks_results)} task results.")
+    
+    # TODO: Parse results
+
+    num_embeddings = await asyncio.to_thread(chroma_collection.count)
+    print(f"There are {num_embeddings} embeddings in the collection.")
 
     end_time = time.time()
     print(f"Data indexing pipeline ran in {end_time - start_time} seconds")
