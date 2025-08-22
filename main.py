@@ -2,6 +2,7 @@ import asyncio
 import boto3
 import chromadb
 from chromadb.errors import NotFoundError
+from chromadb.types import Metadata, Where
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from collections.abc import Awaitable
 from datetime import datetime
@@ -17,7 +18,7 @@ from requests.exceptions import HTTPError
 import time
 import tmdbsimple as tmdb # type: ignore
 import traceback
-from typing import Any
+from typing import Any, cast
 
 load_dotenv(dotenv_path=".env.development")
 app = FastAPI()
@@ -27,6 +28,7 @@ REDIS_TTL = 60 * 60 * 24 * 7 # one week
 S3_MOVIES_PATH_PREFIX = "movies/"
 EMBEDDING_MODEL_NAME="text-embedding-3-small"
 CHROMA_COLLECTION_NAME="movies"
+MAX_QUERY_RESULTS=10
 
 tmdb.API_KEY = os.getenv("TMDB_API_KEY")
 
@@ -253,7 +255,9 @@ def index_single_movie_sync(object_key: str) -> None:
 
     # Parse important metadata from the movie dict
 
-    movie_id: int = movie["id"]
+    movie_id: int | None = movie["id"]
+    if movie_id is None:
+        raise TypeError("No movie id found")
     title: str | None = movie["title"]
     release_year: int | None
     try:
@@ -397,8 +401,11 @@ class ExecuteDataPipelineRequest(BaseModel):
     skip_data_acquisition: bool = False
     password: str # Potential improvement: use auth headers
 
-@app.post("/admin/data_pipeline")
-async def execute_data_pipeline(payload: ExecuteDataPipelineRequest) -> dict[str, str]:
+class DataPipelineResponse(BaseModel):
+    has_completed: bool
+
+@app.post("/admin/execute_data_pipeline")
+async def execute_data_pipeline(payload: ExecuteDataPipelineRequest) -> DataPipelineResponse:
     try:
         if payload.password != os.getenv("ADMIN_API_KEY"):
             raise HTTPException(
@@ -421,8 +428,73 @@ async def execute_data_pipeline(payload: ExecuteDataPipelineRequest) -> dict[str
         await perform_data_indexing()
         
         print("Data pipeline is complete.")
-        return {"status": "complete"}
+        return DataPipelineResponse(has_completed=True)
     except Exception:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error has occurred."
+        )
+
+class RecommendationPayload(BaseModel):
+    user_query: str
+
+class Recommendation(BaseModel):
+    recommendation: str
+
+async def get_prompt_section_movie_content(user_query: str) -> str:
+    """
+        Takes in the user input asking for a recommendation
+        Queries ChromaDB for semantically similar content
+        Formats the retrieval results into a string format for LLM
+    """
+    initial_query_results = await asyncio.to_thread(
+        chroma_collection.query,
+        query_texts=user_query,
+        n_results=3
+    )
+    
+    # Get a list of movie id's from the query results returned by Chroma
+    relevant_movie_ids: list[int | str] = [
+        cast(int, movie["movie_id"])
+        for movie in cast(list[list[Metadata]],
+                          initial_query_results["metadatas"])[0]
+    ]
+
+    # Remove duplicate movie id's
+    # relevant_movie_ids = list(set(relevant_movie_ids))
+
+    # For each movie id, fetch all data for that movie from ChromaDB
+    full_movie_results = await asyncio.to_thread(
+        chroma_collection.get,
+        where=cast(Where, {
+            "movie_id": {"$in": relevant_movie_ids}
+        }), # alternatively can form embedding id directly
+    )
+
+    metadatas = cast(list[Metadata], full_movie_results["metadatas"])
+    documents = cast(list[str], full_movie_results["documents"])
+
+    print(len(metadatas))
+    print(len(documents))
+
+    return "Temp result"
+    
+@app.post("/recommend")
+async def generate_recommendation(payload: RecommendationPayload) -> Recommendation:
+    """
+        Main RAG endpoint for generating a movie recommendation
+        Queries ChromaDB for semantically similar content to the user's query
+        An LLM uses this context to output a natural language response
+    """
+    try:
+        temp_response = payload.user_query.upper()
+
+        prompt_section_movie_content = await get_prompt_section_movie_content(payload.user_query)
+
+        return Recommendation(recommendation=temp_response)
+    except Exception as e:
+        print(e)
         traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
