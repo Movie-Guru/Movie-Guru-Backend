@@ -217,7 +217,7 @@ async def perform_data_acquisition() -> None:
     # Process results of the batched tasks
     num_movies_processed = 0
     for res in movie_tasks_results:
-        if isinstance(res, Exception):
+        if isinstance(res, BaseException):
             e = res
             print("Task failed:")
             if isinstance(e, HTTPError):
@@ -252,27 +252,28 @@ def index_single_movie_sync(object_key: str) -> None:
     movie = json.loads(obj_response["Body"].read().decode("utf-8")) # type: ignore
 
     # Parse important metadata from the movie dict
+
     movie_id: int = movie["id"]
-    title: str = movie["title"]
+    title: str | None = movie["title"]
     release_year: int | None
     try:
         release_year = datetime.fromisoformat(movie["release_date"]).year
     except ValueError:
         release_year = None
     genres: str | None = ", ".join([obj["name"] for obj in movie["genres"]]) or None
-    average_rating: float = movie["vote_average"]
-    popularity_score: float = movie["popularity"]
+    average_rating: float | None = movie["vote_average"]
+    popularity_score: float | None = movie["popularity"]
     cast: str | None = ", ".join([member["name"] for member in movie["cast"]]) or None
     director: str | None = ", ".join(
         [member["name"]
         for member in movie["crew"]
         if member["job"].lower() == "director"]
     ) or None
-    revenue: int = movie["revenue"]
-    runtime: int = movie["runtime"]
-    overview: str = movie["overview"]
+    revenue: int | None = movie["revenue"]
+    runtime: int | None = movie["runtime"]
+    overview: str | None = movie["overview"]
 
-    metadata: dict[str, str | int | float | None] = {
+    metadata: dict[str, Any] = {
         "movie_id": movie_id,
         "title": title,
         "release_year": release_year,
@@ -283,6 +284,13 @@ def index_single_movie_sync(object_key: str) -> None:
         "director": director,
         "revenue": revenue,
         "runtime": runtime
+    }
+
+    # Remove entries whose value is None
+    cleaned_metadata: dict[str, Any] = {
+        key: val
+        for key, val in metadata.items()
+        if val is not None
     }
 
     # Create embeddings for each of the text attributes
@@ -299,7 +307,7 @@ def index_single_movie_sync(object_key: str) -> None:
             f"Director: {director}",
             f"Overview: {overview}"
         ],
-        metadatas=[dict(metadata) for _ in range(3)]
+        metadatas=[dict(cleaned_metadata) for _ in range(3)]
     )
 
 def prepare_chroma_collection_sync() -> None:
@@ -363,12 +371,24 @@ async def perform_data_indexing() -> None:
         return_exceptions=True
     )
 
-    print(f"There are {len(indexing_tasks_results)} task results.")
-    
-    # TODO: Parse results
+    # Process results of the batched tasks
+    num_results_processed = 0
+    for res in indexing_tasks_results:
+        if isinstance(res, BaseException):
+            e = res
+            print("Task failed:")
+            print(e)
+        else:
+            num_results_processed += 1
 
+    print(
+        f"{num_results_processed} out of {len(indexing_tasks_results)}"
+        " movies have been successfully indexed."
+    )
+
+    # Check the number of embeddings in the Chroma collection
     num_embeddings = await asyncio.to_thread(chroma_collection.count)
-    print(f"There are {num_embeddings} embeddings in the collection.")
+    print(f"There are {num_embeddings} embeddings in the Chroma collection.")
 
     end_time = time.time()
     print(f"Data indexing pipeline ran in {end_time - start_time} seconds")
