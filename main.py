@@ -12,7 +12,7 @@ import json
 from openai import OpenAI
 import os
 from pprint import pprint # type: ignore
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import redis
 from requests.exceptions import HTTPError
 import time
@@ -23,12 +23,69 @@ from typing import Any, cast
 load_dotenv(dotenv_path=".env.development")
 app = FastAPI()
 
+# Data ingestion pipeline
 NUM_MOVIES = 10000
 REDIS_TTL = 60 * 60 * 24 * 7 # one week
 S3_MOVIES_PATH_PREFIX = "movies/"
-EMBEDDING_MODEL_NAME="text-embedding-3-small"
-CHROMA_COLLECTION_NAME="movies"
-MAX_QUERY_RESULTS=10
+
+# OpenAI and ChromaDB
+EMBEDDING_MODEL_NAME = "text-embedding-3-small"
+CHROMA_COLLECTION_NAME = "movies"
+MAX_QUERY_RESULTS = 10
+
+# Semantic key names for semantic movie attributes stored as documents 
+# Must match the keys of the MovieSchema BaseModel below
+# Also used for generating embedding ids
+# and creating JSON that is passed to the LLM
+CAST_KEY = "cast"
+DIRECTORS_KEY = "directors"
+OVERVIEW_KEY = "overview"
+SEMANTIC_KEYS = [CAST_KEY, DIRECTORS_KEY, OVERVIEW_KEY]
+KEYS_NOT_IN_METADATA = [OVERVIEW_KEY]
+
+# DATA STRUCTURES
+
+# Consistent schema for JSON input to LLM
+# Also the metadata schema for embeddings is based on this
+# When declaring or instantiating a TypedDict or BaseModel,
+# the key must be a hardcoded literal
+class MovieSchema(BaseModel):
+    movie_id: int | None = None
+    title: str | None = None
+    release_year: int | None = None
+    genres: list[str] | None = None
+    average_rating: float | None = None
+    popularity_score: float | None = None
+    cast: list[str] | None = None
+    directors: list[str] | None = None
+    revenue: int | None = None
+    runtime: int | None = None
+    overview: str | None = None
+
+    @field_validator("genres", "cast", "directors", mode="before")
+    @classmethod
+    def split_comma_separated_strings(cls, v: Any):
+        # If the value is a string containing comma-separated strings
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",")] or None
+        # Otherwise, do nothing
+        print("not appearing :(")
+        return v
+
+class ExecuteDataPipelineRequest(BaseModel):
+    skip_data_acquisition: bool = False
+    password: str # Potential improvement: use auth headers
+
+class DataPipelineResponse(BaseModel):
+    has_completed: bool
+
+class RecommendationPayload(BaseModel):
+    user_query: str
+
+class Recommendation(BaseModel):
+    recommendation: str
+
+# SETUP FUNCTIONS
 
 tmdb.API_KEY = os.getenv("TMDB_API_KEY")
 
@@ -59,6 +116,8 @@ chroma_collection = chroma_client.get_or_create_collection(
     name=CHROMA_COLLECTION_NAME,
     embedding_function=openai_ef # type: ignore
 )
+
+# HELPER FUNCTIONS
 
 async def get_popular_movie_ids() -> list[int]:
     """
@@ -235,7 +294,6 @@ async def perform_data_acquisition() -> None:
         f"{num_movies_processed} movies have been fetched and stored in S3."
     )
 
-x: int = 0
 
 def index_single_movie_sync(object_key: str) -> None:
     """
@@ -251,67 +309,78 @@ def index_single_movie_sync(object_key: str) -> None:
     )
     
     # Decode the S3 object response into a local dict
-    movie = json.loads(obj_response["Body"].read().decode("utf-8")) # type: ignore
+    movie_from_bucket = json.loads(obj_response["Body"].read().decode("utf-8")) # type: ignore
 
     # Parse important metadata from the movie dict
-
-    movie_id: int | None = movie["id"]
-    if movie_id is None:
-        raise TypeError("No movie id found")
-    title: str | None = movie["title"]
     release_year: int | None
     try:
-        release_year = datetime.fromisoformat(movie["release_date"]).year
+        release_year = datetime.fromisoformat(movie_from_bucket["release_date"]).year
     except ValueError:
         release_year = None
-    genres: str | None = ", ".join([obj["name"] for obj in movie["genres"]]) or None
-    average_rating: float | None = movie["vote_average"]
-    popularity_score: float | None = movie["popularity"]
-    cast: str | None = ", ".join([member["name"] for member in movie["cast"]]) or None
-    director: str | None = ", ".join(
-        [member["name"]
-        for member in movie["crew"]
-        if member["job"].lower() == "director"]
-    ) or None
-    revenue: int | None = movie["revenue"]
-    runtime: int | None = movie["runtime"]
-    overview: str | None = movie["overview"]
 
-    metadata: dict[str, Any] = {
-        "movie_id": movie_id,
-        "title": title,
-        "release_year": release_year,
-        "genres": genres,
-        "average_rating": average_rating,
-        "popularity_score": popularity_score,
-        "cast": cast,
-        "director": director,
-        "revenue": revenue,
-        "runtime": runtime
-    }
+    movie = MovieSchema(
+        movie_id=movie_from_bucket["id"],
+        title=movie_from_bucket["title"],
+        release_year=release_year,
+        genres=[
+            obj["name"]
+            for obj in movie_from_bucket["genres"]
+        ] or None,
+        average_rating=movie_from_bucket["vote_average"],
+        popularity_score=movie_from_bucket["popularity"],
+        cast=[
+            member["name"]
+            for member in movie_from_bucket["cast"]
+        ],
+        directors=[
+            member["name"]
+            for member in movie_from_bucket["crew"]
+            if member["job"].lower() == "director"
+        ] or None,
+        revenue=movie_from_bucket["revenue"],
+        runtime=movie_from_bucket["runtime"],
+        overview=movie_from_bucket["overview"]
+    )
 
-    # Remove entries whose value is None
-    cleaned_metadata: dict[str, Any] = {
-        key: val
-        for key, val in metadata.items()
-        if val is not None
-    }
+    if movie.movie_id is None:
+        raise TypeError("No movie id found")
+    if movie.title is None:
+        raise TypeError("No movie title found")
+    
+    # Use the schema to get a metadata dict
+    # To get a metadata dict, remove pairs whose value is None
+    # Also convert each list of strings into a string of CSV
+    metadata: dict[str, Any] = {}
+    for key, val in movie.model_dump(exclude=set(KEYS_NOT_IN_METADATA)).items():
+        if val is not None:
+            if isinstance(val, list):
+                metadata[key] = ", ".join(cast(list[str], val))
+            else:
+                metadata[key] = val
 
-    # Create embeddings for each of the text attributes
-    # Add embeddings to Chroma collection
+    # Prepare parameters for adding embeddings to Chroma collection
+    ids: list[str] = []
+    documents: list[str] = []
+    metadatas: list[Metadata] = []
+
+    ids = [
+        f"{movie.movie_id}-{CAST_KEY}",
+        f"{movie.movie_id}-{DIRECTORS_KEY}",
+        f"{movie.movie_id}-{OVERVIEW_KEY}",
+    ]
+    documents=[
+        f"{CAST_KEY}: {getattr(movie, CAST_KEY)}",
+        f"{DIRECTORS_KEY}: {getattr(movie, DIRECTORS_KEY)}",
+        f"{OVERVIEW_KEY}: {getattr(movie, OVERVIEW_KEY)}"
+    ]
+    metadatas=[dict(metadata) for _ in range(len(SEMANTIC_KEYS))]
+
+    # Add contextual embeddings to Chroma collection
     global chroma_collection
     chroma_collection.add(
-        ids=[
-            f"{movie_id}-cast",
-            f"{movie_id}-director",
-            f"{movie_id}-overview"
-        ],
-        documents=[
-            f"Cast: {cast}",
-            f"Director: {director}",
-            f"Overview: {overview}"
-        ],
-        metadatas=[dict(cleaned_metadata) for _ in range(3)]
+        ids=ids,
+        documents=documents,
+        metadatas=metadatas
     )
 
 def prepare_chroma_collection_sync() -> None:
@@ -397,12 +466,89 @@ async def perform_data_indexing() -> None:
     end_time = time.time()
     print(f"Data indexing pipeline ran in {end_time - start_time} seconds")
 
-class ExecuteDataPipelineRequest(BaseModel):
-    skip_data_acquisition: bool = False
-    password: str # Potential improvement: use auth headers
+async def get_prompt_section_movie_content(user_query: str) -> str:
+    """
+        Takes in the user input asking for a recommendation
+        Queries ChromaDB for semantically similar content
+        Formats the retrieval results into a string format for LLM
+    """
+    initial_query_results = await asyncio.to_thread(
+        chroma_collection.query,
+        query_texts=user_query,
+        n_results=2
+    )
+    
+    # Get a list of movie id's from the query results returned by Chroma
+    relevant_movie_ids: list[int] = [
+        cast(int, movie["movie_id"])
+        for movie in cast(list[list[Metadata]],
+                          initial_query_results["metadatas"])[0]
+    ]
 
-class DataPipelineResponse(BaseModel):
-    has_completed: bool
+    # Remove duplicate movie id's
+    relevant_movie_ids = list(set(relevant_movie_ids))
+
+    # For each movie id, fetch all data for that movie from ChromaDB
+    full_movie_results = await asyncio.to_thread(
+        chroma_collection.get,
+        where=cast(Where, {
+            "movie_id": {"$in": relevant_movie_ids}
+        }), # alternatively can form embedding id directly
+    )
+
+    # Prepare for parsing results
+    embedding_ids = full_movie_results["ids"]
+    # Cast is used because default type hint is an Optional
+    metadatas = cast(list[Metadata], full_movie_results["metadatas"])
+    documents = cast(list[str], full_movie_results["documents"])
+
+    # Aggregates data for each movie id using the database results
+    # This data will be converted to JSON to be sent to the LLM
+    movie_instance_by_id: dict[int, MovieSchema] = {
+        movie_id : MovieSchema() for movie_id in relevant_movie_ids
+    }
+
+    # Loop through the list of results
+    for embedding_id, metadata, document in zip(embedding_ids, metadatas, documents):
+        # Extract movie id from metadata
+        movie_id = cast(int, metadata["movie_id"])
+        if movie_id not in movie_instance_by_id:
+            continue
+
+        movie_instance: MovieSchema = movie_instance_by_id[movie_id]
+
+        # If metadata info is not populated yet, populate metadata info 
+        # Since "movie_id" is a required attribute found in the metadata dict,
+        # if this attribute is not found in the to-be JSON object,
+        # this indicates that the object has not yet been popululated with
+        # metadata information
+        if movie_instance.movie_id is None:
+            # Create a combined info object with both existing info and new metadata
+            current_info_dict = movie_instance.model_dump(exclude_unset=True)
+            current_info_dict.update(metadata) # Now updated
+
+            # Map the current movie_id to this new BaseModel instance
+            # Correctly parses fields like "genres" using a custom validator function
+            movie_instance_by_id[movie_id] = MovieSchema.model_validate(current_info_dict)
+            
+            # Ensure the variable movie_instance refers to the new
+            # object associated with the current movie_id key 
+            movie_instance = movie_instance_by_id[movie_id]
+        
+        # Check to see which key attribute the current embedding represents
+        # Add non-metadata info like "overview" to the movie instance
+        for key in KEYS_NOT_IN_METADATA:
+            if embedding_id.endswith(key):
+                setattr(movie_instance, key, document)
+    
+    # Convert each movie instance into a dict to get a list of dicts for JSON
+    formatted_movies: list[dict[str, Any]] = [
+        movie_instance.model_dump()
+        for movie_instance in movie_instance_by_id.values()
+    ]
+    return json.dumps(formatted_movies, indent=2) # TODO: Make non-parse-able
+
+# ENDPOINTS
 
 @app.post("/admin/execute_data_pipeline")
 async def execute_data_pipeline(payload: ExecuteDataPipelineRequest) -> DataPipelineResponse:
@@ -436,50 +582,6 @@ async def execute_data_pipeline(payload: ExecuteDataPipelineRequest) -> DataPipe
             detail="An unexpected error has occurred."
         )
 
-class RecommendationPayload(BaseModel):
-    user_query: str
-
-class Recommendation(BaseModel):
-    recommendation: str
-
-async def get_prompt_section_movie_content(user_query: str) -> str:
-    """
-        Takes in the user input asking for a recommendation
-        Queries ChromaDB for semantically similar content
-        Formats the retrieval results into a string format for LLM
-    """
-    initial_query_results = await asyncio.to_thread(
-        chroma_collection.query,
-        query_texts=user_query,
-        n_results=3
-    )
-    
-    # Get a list of movie id's from the query results returned by Chroma
-    relevant_movie_ids: list[int | str] = [
-        cast(int, movie["movie_id"])
-        for movie in cast(list[list[Metadata]],
-                          initial_query_results["metadatas"])[0]
-    ]
-
-    # Remove duplicate movie id's
-    # relevant_movie_ids = list(set(relevant_movie_ids))
-
-    # For each movie id, fetch all data for that movie from ChromaDB
-    full_movie_results = await asyncio.to_thread(
-        chroma_collection.get,
-        where=cast(Where, {
-            "movie_id": {"$in": relevant_movie_ids}
-        }), # alternatively can form embedding id directly
-    )
-
-    metadatas = cast(list[Metadata], full_movie_results["metadatas"])
-    documents = cast(list[str], full_movie_results["documents"])
-
-    print(len(metadatas))
-    print(len(documents))
-
-    return "Temp result"
-    
 @app.post("/recommend")
 async def generate_recommendation(payload: RecommendationPayload) -> Recommendation:
     """
@@ -491,6 +593,7 @@ async def generate_recommendation(payload: RecommendationPayload) -> Recommendat
         temp_response = payload.user_query.upper()
 
         prompt_section_movie_content = await get_prompt_section_movie_content(payload.user_query)
+        print(prompt_section_movie_content)
 
         return Recommendation(recommendation=temp_response)
     except Exception as e:
@@ -502,9 +605,9 @@ async def generate_recommendation(payload: RecommendationPayload) -> Recommendat
         )
 
 @app.get("/")
-async def root() -> dict[str, str]:
+def root() -> dict[str, str]:
     return {"message": "API for Movie Guru Backend"}
 
 @app.get("/status")
-async def get_status() -> dict[str, str]:
+def get_status() -> dict[str, str]:
     return {"status": "ok"}
