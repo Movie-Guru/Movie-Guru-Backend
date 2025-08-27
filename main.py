@@ -8,6 +8,7 @@ from collections.abc import Awaitable
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 import json
 from openai import OpenAI
 import os
@@ -21,7 +22,6 @@ import traceback
 from typing import Any, cast
 
 load_dotenv(dotenv_path=".env.development")
-app = FastAPI()
 
 # Data ingestion pipeline
 NUM_MOVIES = 10000
@@ -37,6 +37,7 @@ MAX_QUERY_RESULTS = 10
 # Must match the keys of the MovieSchema BaseModel below
 # Also used for generating embedding ids
 # and creating JSON that is passed to the LLM
+# Every semantic key's value is either a string or a list of strings
 CAST_KEY = "cast"
 DIRECTORS_KEY = "directors"
 OVERVIEW_KEY = "overview"
@@ -69,7 +70,6 @@ class MovieSchema(BaseModel):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",")] or None
         # Otherwise, do nothing
-        print("not appearing :(")
         return v
 
 class ExecuteDataPipelineRequest(BaseModel):
@@ -85,7 +85,7 @@ class RecommendationPayload(BaseModel):
 class Recommendation(BaseModel):
     recommendation: str
 
-# SETUP FUNCTIONS
+# SERVER SETUP
 
 tmdb.API_KEY = os.getenv("TMDB_API_KEY")
 
@@ -115,6 +115,18 @@ chroma_client = chromadb.PersistentClient()
 chroma_collection = chroma_client.get_or_create_collection(
     name=CHROMA_COLLECTION_NAME,
     embedding_function=openai_ef # type: ignore
+)
+
+app = FastAPI()
+
+possible_origins = [os.getenv("FRONTEND_URL")]
+origins = [origin for origin in possible_origins if origin is not None]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
 
 # HELPER FUNCTIONS
@@ -363,17 +375,17 @@ def index_single_movie_sync(object_key: str) -> None:
     documents: list[str] = []
     metadatas: list[Metadata] = []
 
-    ids = [
-        f"{movie.movie_id}-{CAST_KEY}",
-        f"{movie.movie_id}-{DIRECTORS_KEY}",
-        f"{movie.movie_id}-{OVERVIEW_KEY}",
-    ]
-    documents=[
-        f"{CAST_KEY}: {getattr(movie, CAST_KEY)}",
-        f"{DIRECTORS_KEY}: {getattr(movie, DIRECTORS_KEY)}",
-        f"{OVERVIEW_KEY}: {getattr(movie, OVERVIEW_KEY)}"
-    ]
-    metadatas=[dict(metadata) for _ in range(len(SEMANTIC_KEYS))]
+    # Populate the relevant lists
+    for key in SEMANTIC_KEYS:
+        ids.append(f"{movie.movie_id}-{key}")
+
+        document = getattr(movie, key)
+        if isinstance(document, list):
+            documents.append(", ".join(cast(list[str], document)))
+        else:
+            documents.append(document)
+        
+        metadatas.append(dict(metadata))
 
     # Add contextual embeddings to Chroma collection
     global chroma_collection
@@ -546,7 +558,7 @@ async def get_prompt_section_movie_content(user_query: str) -> str:
         movie_instance.model_dump()
         for movie_instance in movie_instance_by_id.values()
     ]
-    return json.dumps(formatted_movies, indent=2) # TODO: Make non-parse-able
+    return json.dumps(formatted_movies, indent=2) # TODO: Remove indent
 
 # ENDPOINTS
 
