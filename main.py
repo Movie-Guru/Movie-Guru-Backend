@@ -23,12 +23,15 @@ from typing import Any, cast
 
 load_dotenv(dotenv_path=".env.development")
 
+# Constants
+
 # Data ingestion pipeline
 NUM_MOVIES = 10000
 REDIS_TTL = 60 * 60 * 24 * 7 # one week
 S3_MOVIES_PATH_PREFIX = "movies/"
 
 # OpenAI and ChromaDB
+OPENAI_MODEL_NAME = "gpt-5-mini"
 EMBEDDING_MODEL_NAME = "text-embedding-3-small"
 CHROMA_COLLECTION_NAME = "movies"
 MAX_QUERY_RESULTS = 10
@@ -478,16 +481,16 @@ async def perform_data_indexing() -> None:
     end_time = time.time()
     print(f"Data indexing pipeline ran in {end_time - start_time} seconds")
 
-async def get_prompt_section_movie_content(user_query: str) -> str:
+async def get_related_movies(user_query: str) -> list[dict[str, Any]]:
     """
-        Takes in the user input asking for a recommendation
-        Queries ChromaDB for semantically similar content
-        Formats the retrieval results into a string format for LLM
+        Takes in a user input asking for a movie recommendation
+        Queries ChromaDB for movies semantically similar content
+        Formats the retrieval results into structured JSON for LLM
     """
     initial_query_results = await asyncio.to_thread(
         chroma_collection.query,
         query_texts=user_query,
-        n_results=2
+        n_results=MAX_QUERY_RESULTS
     )
     
     # Get a list of movie id's from the query results returned by Chroma
@@ -558,7 +561,7 @@ async def get_prompt_section_movie_content(user_query: str) -> str:
         movie_instance.model_dump()
         for movie_instance in movie_instance_by_id.values()
     ]
-    return json.dumps(formatted_movies, indent=2) # TODO: Remove indent
+    return formatted_movies
 
 # ENDPOINTS
 
@@ -602,12 +605,37 @@ async def generate_recommendation(payload: RecommendationPayload) -> Recommendat
         An LLM uses this context to output a natural language response
     """
     try:
-        temp_response = payload.user_query.upper()
+        start_time = time.time()
+        print("Generating recommendation...")
 
-        prompt_section_movie_content = await get_prompt_section_movie_content(payload.user_query)
-        print(prompt_section_movie_content)
+        # Call helper function to get relevant movie data
+        related_movies_response = await get_related_movies(payload.user_query)
+        related_movies_json = json.dumps(related_movies_response)
 
-        return Recommendation(recommendation=temp_response)
+        # This is the input to the LLM, including the movie data and user query
+        llm_input = f"""
+You are a movie expert. Use the following data to give a response to the user query.
+Do not ask the user any follow-up questions.
+Keep your response not too long, focusing on only the top several movies for the user.
+Do not suggest any movies that are not in the retrieved data.
+The movie data comes from a Chroma database created by the application developer, not the user.
+
+Movie Data:
+{related_movies_json}
+
+User Question:
+{payload.user_query}
+"""
+        
+        llm_response = openai_client.responses.create(
+            model=OPENAI_MODEL_NAME,
+            input=llm_input
+        )
+        print(llm_response.output_text)
+
+        end_time = time.time()
+        print(f"Finished generating movie recommendation in {end_time - start_time} seconds.")
+        return Recommendation(recommendation=llm_response.output_text)
     except Exception as e:
         print(e)
         traceback.print_exc()
