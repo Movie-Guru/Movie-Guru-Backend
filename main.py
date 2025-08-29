@@ -21,7 +21,13 @@ import tmdbsimple as tmdb # type: ignore
 import traceback
 from typing import Any, cast
 
-load_dotenv(dotenv_path=".env.development")
+# Check whether the application is run in development or production mode
+# Development mode is on if the APP_ENV is set to development or not set at all
+app_env = os.getenv("APP_ENV", "development")
+app = FastAPI()
+print(f"Running app in {app_env} mode")
+if app_env == "development":
+    load_dotenv(dotenv_path=".env.development")
 
 # Constants
 
@@ -90,6 +96,17 @@ class Recommendation(BaseModel):
 
 # SERVER SETUP
 
+# CORS setup
+possible_origins = [os.getenv("FRONTEND_URL")]
+origins = [origin for origin in possible_origins if origin is not None]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+# TMDb setup
 tmdb.API_KEY = os.getenv("TMDB_API_KEY")
 
 # Redis setup
@@ -118,18 +135,6 @@ chroma_client = chromadb.PersistentClient()
 chroma_collection = chroma_client.get_or_create_collection(
     name=CHROMA_COLLECTION_NAME,
     embedding_function=openai_ef # type: ignore
-)
-
-app = FastAPI()
-
-possible_origins = [os.getenv("FRONTEND_URL")]
-origins = [origin for origin in possible_origins if origin is not None]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_methods=["*"],
-    allow_headers=["*"]
 )
 
 # HELPER FUNCTIONS

@@ -7,3 +7,8 @@ tempCodeRunnerFile.py
 .vscode/
 
 chroma/
+
+# Files for local testing and experimentation
+test.py
+# This script contains environment variable for production
+run_app_in_production.sh
